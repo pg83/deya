@@ -1,0 +1,76 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+
+with open(sys.argv[1]) as f:
+    data = json.loads(f.read())
+
+by_out = {}
+patterns = [x['pattern'] for x in data['conf']['resources']]
+
+def it_repls():
+    yield '$(PYTHON)/python', 'python3'
+
+    for p in patterns:
+        yield f'$({p})/bin/', ''
+        yield f'$({p})/', ''
+
+replaces = list(it_repls())
+
+by_dep = {}
+
+for n in data['graph']:
+    by_dep[n['uid']] = n
+
+def o_repls(n):
+    for o in n['outputs']:
+        yield o, o.replace('$(BUILD_ROOT)', '$(BUILD_ROOT)/' + n['uid'])
+
+def n_repls(n):
+    for d in n['deps']:
+        yield from o_repls(by_dep[d])
+
+    yield from o_repls(n)
+
+def m_repl(d, l):
+    for r, t in l:
+        d = d.replace(r, t)
+
+    return d
+
+def dedup():
+    for n in data['graph']:
+        repls = sorted(list(n_repls(n)), key=lambda x: -len(x[1]))
+
+        yield json.loads(m_repl(json.dumps(n), repls))
+
+#graph = list(dedup())
+graph = data['graph']
+
+by_out = {}
+
+for n in graph:
+    for o in n['outputs']:
+        #assert o not in by_out
+        by_out[o] = n
+
+for n in graph:
+    for i in n['inputs']:
+        if 'SOURCE_ROOT' in i:
+            continue
+
+        _ = by_out[i]
+
+def it_parts():
+    for n in graph:
+        yield ' '.join(n['outputs']) + ': ' + ' '.join(n['inputs'])
+
+        for o in n['outputs']:
+            yield '\tmkdir -p ' + os.path.dirname(o)
+
+        for c in n['cmds']:
+            yield '\t' + ' '.join(c['cmd_args'])
+
+print(m_repl('\n'.join(it_parts()), replaces))
