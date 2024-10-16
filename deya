@@ -3,15 +3,16 @@
 import os
 import sys
 import json
+import hashlib
 
-with open(sys.argv[1]) as f:
-    data = json.loads(f.read())
+data = json.loads(sys.stdin.read())
 
 by_out = {}
-patterns = [x['pattern'] for x in data['conf']['resources']]
+patterns = dict([(x['pattern'], x) for x in data['conf']['resources']])
 
 def it_repls():
     yield '$(PYTHON)/python', 'python3'
+    yield '$(VCS)/', '$(BUILD_ROOT)/'
 
     for p in patterns:
         yield f'$({p})/bin/', ''
@@ -56,6 +57,26 @@ for n in graph:
         #assert o not in by_out
         by_out[o] = n
 
+def it_extra():
+    vcs = patterns['VCS']['resource'].split(':')[-1]
+
+    yield {
+        'cmds': [
+            {
+                'cmd_args': [
+                    f'sh -c "echo {vcs} | base64 -d > $(BUILD_ROOT)/vcs.json"'
+                ],
+            },
+        ],
+        'inputs': [
+        ],
+        'outputs': [
+            '$(BUILD_ROOT)/vcs.json',
+        ],
+    }
+
+graph = list(it_extra()) + list(by_out.values())
+
 for n in graph:
     for i in n['inputs']:
         if 'SOURCE_ROOT' in i:
@@ -63,14 +84,57 @@ for n in graph:
 
         _ = by_out[i]
 
+def flt_cmd(c):
+    for p in c:
+        if p.startswith('-B$('):
+            pass
+        elif p.startswith('--sysroot='):
+            yield '$(CFLAGS)'
+        else:
+            yield p
+
+CV = {}
+
+def render_cmd(n):
+    for o in n['outputs']:
+        yield 'mkdir -p ' + os.path.dirname(o)
+
+    for c in n['cmds']:
+        if 'cwd' in c:
+            yield 'cd ' + c['cwd']
+
+        args = list(flt_cmd(c['cmd_args']))
+
+        if '-c' in args and '-o' in args and 'ROOT)/' in args[-1]:
+            c = args[6:-1]
+            ch = hashlib.md5(json.dumps(c).encode()).hexdigest()
+            if ch not in CV:
+                CV[ch] = f'V' + str(len(CV)) + '=' + ' '.join(c)
+            yield ' '.join(args[:6] + ['$(' + CV[ch].split('=')[0] + ')', args[-1]])
+        else:
+            yield ' '.join(args)
+
+def cmd_inputs(n):
+    for x in n['inputs']:
+        if 'BUILD_ROOT' in x:
+            yield x
+
+    if '$(VCS)/vcs.json' in str(n):
+        yield '$(BUILD_ROOT)/vcs.json'
+
 def it_parts():
+    yield '.ONESHELL:'
+    yield '__VARS__'
+
     for n in graph:
-        yield ' '.join(n['outputs']) + ': ' + ' '.join(n['inputs'])
+        yield ' '.join(n['outputs']) + ': ' + ' '.join(cmd_inputs(n))
 
-        for o in n['outputs']:
-            yield '\tmkdir -p ' + os.path.dirname(o)
+        for c in render_cmd(n):
+            yield '\t' + c
 
-        for c in n['cmds']:
-            yield '\t' + ' '.join(c['cmd_args'])
+EXTRA = [
+    ('$(BUILD_ROOT)', '$(B)'),
+    ('$(SOURCE_ROOT)', '$(S)'),
+]
 
-print(m_repl('\n'.join(it_parts()), replaces))
+print(m_repl('\n'.join(it_parts()), replaces + [('__VARS__', '\n'.join(CV.values()))] + EXTRA))
