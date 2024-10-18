@@ -3,12 +3,17 @@
 import os
 import sys
 import json
+import base64
 import hashlib
 
 data = json.loads(sys.stdin.read())
 
-by_out = {}
 patterns = dict([(x['pattern'], x) for x in data['conf']['resources']])
+
+EXTRA = [
+    ('$(BUILD_ROOT)', '$(B)'),
+    ('$(SOURCE_ROOT)', '$(S)'),
+]
 
 def it_repls():
     yield '$(PYTHON)/python', 'python3'
@@ -20,41 +25,18 @@ def it_repls():
 
 replaces = list(it_repls())
 
-by_dep = {}
-
-for n in data['graph']:
-    by_dep[n['uid']] = n
-
-def o_repls(n):
-    for o in n['outputs']:
-        yield o, o.replace('$(BUILD_ROOT)', '$(BUILD_ROOT)/' + n['uid'])
-
-def n_repls(n):
-    for d in n['deps']:
-        yield from o_repls(by_dep[d])
-
-    yield from o_repls(n)
-
 def m_repl(d, l):
     for r, t in l:
         d = d.replace(r, t)
 
     return d
 
-def dedup():
-    for n in data['graph']:
-        repls = sorted(list(n_repls(n)), key=lambda x: -len(x[1]))
-
-        yield json.loads(m_repl(json.dumps(n), repls))
-
-#graph = list(dedup())
 graph = data['graph']
 
 by_out = {}
 
 for n in graph:
     for o in n['outputs']:
-        #assert o not in by_out
         by_out[o] = n
 
 def it_extra():
@@ -64,18 +46,31 @@ def it_extra():
         'cmds': [
             {
                 'cmd_args': [
-                    f'sh -c "echo {vcs} | base64 -d > $(BUILD_ROOT)/vcs.json"'
+                    'sh',
+                    '-c',
+                    f'echo {vcs} | base64 -d > $(B)/vcs.json'
                 ],
+                'env': {},
             },
         ],
         'inputs': [
         ],
         'outputs': [
-            '$(BUILD_ROOT)/vcs.json',
+            '$(B)/vcs.json',
         ],
     }
 
-graph = list(it_extra()) + list(by_out.values())
+def uniq(lst):
+    v = set()
+
+    for n in lst:
+       k = n['uid']
+
+       if k not in v:
+           v.add(k)
+           yield n
+
+graph = list(it_extra()) + list(uniq(by_out.values()))
 
 for n in graph:
     for i in n['inputs']:
@@ -93,11 +88,45 @@ def flt_cmd(c):
         else:
             yield p
 
+def is_hard(arg):
+    for ch in arg:
+        if ch in ' #':
+            return True
+
+def is_hard_cmd(cmd):
+    for c in cmd:
+        if is_hard(c):
+            return True
+
 CV = {}
 
+def nt_env(e):
+    e = json.loads(json.dumps(e))
+
+    for k in ('ARCADIA_ROOT_DISTBUILD', 'CPATH', 'DYLD_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'LIBRARY_PATH', 'SDKROOT'):
+        if k in e:
+            e.pop(k)
+
+    return e
+
+def render_generic_cmd(n):
+    cmd = [
+        'python3',
+        '$(S)/build/scripts/generic_cmd.py',
+        'S=$(S)',
+        'B=$(B)',
+        '--',
+        base64.b64encode(m_repl(json.dumps(n), replaces + EXTRA).encode()).decode(),
+    ]
+
+    return render_easy_cmd(cmd)
+
+def render_easy_cmd(args):
+    return ' '.join(args).replace('"', '\\"')
+
 def render_cmd(n):
-    for o in n['outputs']:
-        yield 'mkdir -p ' + os.path.dirname(o)
+    for d in frozenset(os.path.dirname(o) for o in n['outputs']):
+        yield 'mkdir -p ' + d
 
     for c in n['cmds']:
         if 'cwd' in c:
@@ -105,14 +134,18 @@ def render_cmd(n):
 
         args = list(flt_cmd(c['cmd_args']))
 
-        if '-c' in args and '-o' in args and 'ROOT)/' in args[-1]:
+        if 'stdout' in c or nt_env(c['env']) or is_hard_cmd(args):
+            yield render_generic_cmd(c)
+        elif '-c' in args and '-o' in args and 'ROOT)/' in args[-1]:
             c = args[6:-1]
             ch = hashlib.md5(json.dumps(c).encode()).hexdigest()
+
             if ch not in CV:
-                CV[ch] = f'V' + str(len(CV)) + '=' + ' '.join(c)
-            yield ' '.join(args[:6] + ['$(' + CV[ch].split('=')[0] + ')', args[-1]])
+                CV[ch] = f'V' + str(len(CV)) + '=' + render_easy_cmd(c)
+
+            yield render_easy_cmd(args[:6] + ['$(' + CV[ch].split('=')[0] + ')', args[-1]])
         else:
-            yield ' '.join(args)
+            yield render_easy_cmd(args)
 
 def cmd_inputs(n):
     for x in n['inputs']:
@@ -123,6 +156,8 @@ def cmd_inputs(n):
         yield '$(BUILD_ROOT)/vcs.json'
 
 def it_parts():
+    yield 'export ARCADIA_ROOT_DISTBUILD = $(S)'
+    yield 'export PYTHONPATH = $(S)/build/scripts'
     yield '.ONESHELL:'
     yield '__VARS__'
 
@@ -131,10 +166,5 @@ def it_parts():
 
         for c in render_cmd(n):
             yield '\t' + c
-
-EXTRA = [
-    ('$(BUILD_ROOT)', '$(B)'),
-    ('$(SOURCE_ROOT)', '$(S)'),
-]
 
 print(m_repl('\n'.join(it_parts()), replaces + [('__VARS__', '\n'.join(CV.values()))] + EXTRA))
