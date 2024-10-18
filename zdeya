@@ -1,0 +1,181 @@
+#!/usr/bin/env python3
+
+import os
+import sys
+import json
+import base64
+import hashlib
+
+data = json.loads(sys.stdin.read())
+
+patterns = dict([(x['pattern'], x) for x in data['conf']['resources']])
+
+EXTRA = [
+    ('$(BUILD_ROOT)', '$(B)'),
+    ('$(SOURCE_ROOT)', '$(S)'),
+]
+
+def it_repls():
+    yield '$(PYTHON)/python', 'python3'
+    yield '$(VCS)/', '$(BUILD_ROOT)/'
+
+    for p in patterns:
+        yield f'$({p})/bin/', ''
+        yield f'$({p})/', ''
+
+replaces = list(it_repls())
+
+def m_repl(d, l):
+    for r, t in l:
+        d = d.replace(r, t)
+
+    return d
+
+graph = data['graph']
+
+by_out = {}
+
+for n in graph:
+    for o in n['outputs']:
+        by_out[o] = n
+
+def it_extra():
+    vcs = patterns['VCS']['resource'].split(':')[-1]
+
+    yield {
+        'cmds': [
+            {
+                'cmd_args': [
+                    'sh',
+                    '-c',
+                    f'echo {vcs} | base64 -d > $(B)/vcs.json'
+                ],
+                'env': {},
+            },
+        ],
+        'inputs': [
+        ],
+        'outputs': [
+            '$(B)/vcs.json',
+        ],
+    }
+
+def uniq(lst):
+    v = set()
+
+    for n in lst:
+       k = n['uid']
+
+       if k not in v:
+           v.add(k)
+           yield n
+
+graph = list(it_extra()) + list(uniq(by_out.values()))
+
+for n in graph:
+    for i in n['inputs']:
+        if 'SOURCE_ROOT' in i:
+            continue
+
+        _ = by_out[i]
+
+def flt_cmd(c):
+    for p in c:
+        if p.startswith('-B$('):
+            pass
+        elif p.startswith('--sysroot='):
+            yield '$(CFLAGS)'
+        else:
+            yield p
+
+def is_hard(arg):
+    for ch in arg:
+        if ch in ' #':
+            return True
+
+def is_hard_cmd(cmd):
+    for c in cmd:
+        if is_hard(c):
+            return True
+
+CV = {}
+
+def nt_env(e):
+    e = json.loads(json.dumps(e))
+
+    for k in ('ARCADIA_ROOT_DISTBUILD', 'CPATH', 'DYLD_LIBRARY_PATH', 'LD_LIBRARY_PATH', 'LIBRARY_PATH', 'SDKROOT'):
+        if k in e:
+            e.pop(k)
+
+    return e
+
+def render_generic_cmd(n):
+    cmd = [
+        'python3',
+        '$(S)/build/scripts/generic_cmd.py',
+        'S=$(S)',
+        'B=$(B)',
+        '--',
+        base64.b64encode(m_repl(json.dumps(n), replaces + EXTRA).encode()).decode(),
+    ]
+
+    return render_easy_cmd(cmd)
+
+def render_easy_cmd(args):
+    return ' '.join(args).replace('"', '\\"')
+
+def intern_one(c):
+    if '/' in c and len(c) > 10:
+        c = intern_one(os.path.dirname(c)) + '/' + os.path.basename(c)
+
+    ch = hashlib.md5(json.dumps(c).encode()).hexdigest()
+
+    if ch not in CV:
+        CV[ch] = f'V' + str(len(CV)) + '=' + render_easy_cmd([c])
+
+    return '$(' + CV[ch].split('=')[0] + ')'
+
+def intern(c):
+    if len(c) == 1:
+        return intern_one(c[0])
+
+    return intern_one(' '.join(intern_one(x) for x in c))
+
+def render_cmd(n):
+    for d in frozenset(os.path.dirname(o) for o in n['outputs']):
+        yield 'mkdir -p ' + intern_one(d)
+
+    for c in n['cmds']:
+        if 'cwd' in c:
+            yield 'cd ' + c['cwd']
+
+        args = list(flt_cmd(c['cmd_args']))
+
+        if 'stdout' in c or nt_env(c['env']) or is_hard_cmd(args):
+            yield render_generic_cmd(c)
+        elif '-c' in args and '-o' in args and 'ROOT)/' in args[-1]:
+            yield render_easy_cmd([intern_one(x) for x in args[:6]] + [intern(args[6:-1]), intern_one(args[-1])])
+        else:
+            yield render_easy_cmd([intern_one(x) for x in args])
+
+def cmd_inputs(n):
+    for x in n['inputs']:
+        if 'BUILD_ROOT' in x:
+            yield x
+
+    if '$(VCS)/vcs.json' in str(n):
+        yield '$(BUILD_ROOT)/vcs.json'
+
+def it_parts():
+    yield 'export ARCADIA_ROOT_DISTBUILD = $(S)'
+    yield 'export PYTHONPATH = $(S)/build/scripts'
+    yield '.ONESHELL:'
+    yield '__VARS__'
+
+    for n in graph:
+        yield ' '.join(intern_one(x) for x in n['outputs']) + ': ' + ' '.join(intern_one(x) for x in cmd_inputs(n))
+
+        for c in render_cmd(n):
+            yield '\t' + c
+
+print(m_repl('\n'.join(it_parts()), replaces + [('__VARS__', '\n'.join(CV.values()))] + EXTRA))
