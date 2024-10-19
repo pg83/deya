@@ -13,6 +13,7 @@ patterns = dict([(x['pattern'], x) for x in data['conf']['resources']])
 EXTRA = [
     ('$(BUILD_ROOT)', '$(B)'),
     ('$(SOURCE_ROOT)', '$(S)'),
+    ('python3 $(S)/build/scripts/cpp_proto_wrapper.py', 'flock $(S)/build/scripts/cpp_proto_wrapper.py python3 $(S)/build/scripts/cpp_proto_wrapper.py'),
 ]
 
 def it_repls():
