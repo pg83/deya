@@ -35,13 +35,22 @@ def m_repl(d, l):
 graph = data['graph']
 
 by_out = {}
+by_uid = {}
 
 for n in graph:
+    by_uid[n['uid']] = n
+
     for o in n['outputs']:
         by_out[o] = n
 
 def it_extra():
-    vcs = patterns['VCS']['resource'].split(':')[-1]
+    try:
+        vcs = patterns['VCS']['resource'].split(':')[-1]
+    except KeyError:
+        vcs = {
+        }
+
+        vcs = base64.b64encode(json.dumps(vcs).encode()).decode()
 
     yield {
         'cmds': [
@@ -148,13 +157,22 @@ def render_cmd(n):
         else:
             yield render_easy_cmd(args)
 
-def cmd_inputs(n):
-    for x in n['inputs']:
-        if 'BUILD_ROOT' in x:
-            yield x
+def cmd_inputs_0(n):
+    yield from n['inputs']
+
+    for d in n.get('deps', []):
+        yield from by_uid[d]['outputs']
 
     if '$(VCS)/vcs.json' in str(n):
         yield '$(BUILD_ROOT)/vcs.json'
+
+def cmd_inputs_1(n):
+    for x in cmd_inputs_0(n):
+        if 'BUILD_ROOT' in x:
+            yield x
+
+def cmd_inputs(n):
+    return sorted(list(frozenset(cmd_inputs_1(n))))
 
 def it_parts():
     yield 'export ARCADIA_ROOT_DISTBUILD = $(S)'
